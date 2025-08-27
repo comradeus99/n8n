@@ -35,24 +35,38 @@ fi
 # Sử dụng thư mục /home trực tiếp
 N8N_DIR="/home/n8n"
 
-# Cài đặt Docker và Docker Compose
+# Cài đặt Docker và Docker Compose (phiên bản mới)
 apt-get update
-apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+apt-get install -y apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release
+
+# Cài đặt Docker (sử dụng script chính thức từ Docker)
+curl -fsSL https://get.docker.com -o get-docker.sh
+sh get-docker.sh
+rm get-docker.sh
+
+# Cài đặt Docker Compose v2 (plugin)
+mkdir -p ~/.docker/cli-plugins/
+curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o ~/.docker/cli-plugins/docker-compose
+chmod +x ~/.docker/cli-plugins/docker-compose
+
+# Khởi động Docker service
+systemctl enable docker
+systemctl start docker
 
 # Tạo thư mục cho n8n
 mkdir -p $N8N_DIR
 
-# Tạo file docker-compose.yml
+# Pull phiên bản n8n mới nhất
+echo "Pulling latest n8n Docker image..."
+docker pull n8nio/n8n:latest
+
+# Tạo file docker-compose.yml với cấu hình tối ưu
 cat << EOF > $N8N_DIR/docker-compose.yml
 version: "3.8"
 services:
   n8n:
     image: n8nio/n8n:latest
-    restart: always
+    restart: unless-stopped
     environment:
       - N8N_HOST=${DOMAIN}
       - N8N_PORT=5678
@@ -61,17 +75,18 @@ services:
       - WEBHOOK_URL=https://${DOMAIN}
       - GENERIC_TIMEZONE=Asia/Ho_Chi_Minh
       - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_METRICS=false
       - N8N_SECURE_COOKIE=true
-      - N8N_LOG_LEVEL=info
+      - N8N_PERSONALIZATION_ENABLED=false
     volumes:
-      - $N8N_DIR/.n8n:/home/node/.n8n
+      - n8n_data:/home/node/.n8n
     networks:
       - n8n_network
     dns:
       - 8.8.8.8
       - 1.1.1.1
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5678/healthz"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5678/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -79,16 +94,17 @@ services:
 
   caddy:
     image: caddy:2-alpine
-    restart: always
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - $N8N_DIR/Caddyfile:/etc/caddy/Caddyfile
+      - $N8N_DIR/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - n8n
+      n8n:
+        condition: service_healthy
     networks:
       - n8n_network
 
@@ -97,43 +113,49 @@ networks:
     driver: bridge
 
 volumes:
+  n8n_data:
+    driver: local
   caddy_data:
-    external: false
+    driver: local
   caddy_config:
-    external: false
+    driver: local
 EOF
 
 # Tạo file Caddyfile với cấu hình bảo mật tốt hơn
 cat << EOF > $N8N_DIR/Caddyfile
 ${DOMAIN} {
     reverse_proxy n8n:5678 {
-        health_uri /healthz
-        health_interval 30s
-        health_timeout 10s
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
     }
     
-    # Security headers
+    # Bảo mật headers
     header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
         X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https: wss:;"
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
     }
     
-    # Compress responses
-    encode gzip
+    # Tự động HTTPS
+    tls {
+        protocols tls1.2 tls1.3
+    }
     
-    # Log access
+    # Ghi log
     log {
-        output file /var/log/caddy/access.log
+        output file /var/log/caddy/${DOMAIN}.log {
+            roll_size 100mb
+            roll_keep 5
+        }
     }
 }
 EOF
 
-# Tạo thư mục .n8n với quyền phù hợp
-mkdir -p $N8N_DIR/.n8n
+# Tạo thư mục log cho Caddy
+mkdir -p /var/log/caddy
 
 # Đặt quyền cho thư mục n8n
 chown -R 1000:1000 $N8N_DIR
@@ -143,29 +165,41 @@ chmod -R 755 $N8N_DIR
 cd $N8N_DIR
 docker compose up -d
 
-# Đợi một chút để containers khởi động
-echo "Waiting for containers to start..."
-sleep 10
+# Kiểm tra trạng thái
+echo "Waiting for services to start..."
+sleep 30
 
-# Kiểm tra trạng thái containers
-if docker compose ps | grep -q "Up"; then
-    echo ""
-    echo "╔═════════════════════════════════════════════════════════════╗"
-    echo "║                                                             ║"
-    echo "║  ✅ N8n đã được cài đặt thành công!                         ║"
-    echo "║                                                             ║"
-    echo "║  🌐 Truy cập: https://${DOMAIN}                             ║"
-    echo "║                                                             ║"
-    echo "║  📚 Học n8n cơ bản: https://n8n-basic.mecode.pro            ║"
-    echo "║                                                             ║"
-    echo "║  🔧 Quản lý containers:                                     ║"
-    echo "║     - Xem logs: docker compose logs -f                     ║"
-    echo "║     - Restart: docker compose restart                      ║"
-    echo "║     - Stop: docker compose down                            ║"
-    echo "║                                                             ║"
-    echo "╚═════════════════════════════════════════════════════════════╝"
-    echo ""
-else
-    echo "❌ Có lỗi xảy ra khi khởi động containers. Kiểm tra logs:"
-    docker compose logs
-fi
+# Hiển thị trạng thái
+docker compose ps
+
+echo ""
+echo "╔═════════════════════════════════════════════════════════════╗"
+echo "║                                                             "
+echo "║  ✅ N8n đã được cài đặt thành công!                         "
+echo "║                                                             "
+echo "║  🌐 Truy cập: https://${DOMAIN}                             "
+echo "║                                                             "
+echo "║  📊 Kiểm tra logs: docker compose logs -f                   "
+echo "║  🔄 Restart: docker compose restart                         "
+echo "║  ⏹️ Stop: docker compose down                               "
+echo "║                                                             "
+echo "║  📚 Học n8n cơ bản: https://n8n-basic.mecode.pro            "
+echo "║                                                             "
+echo "╚═════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Hướng dẫn cập nhật
+cat << EOF
+
+🔄 HƯỚNG DẪN CẬP NHẬT N8N:
+========================================
+Để cập nhật n8n lên phiên bản mới nhất:
+
+cd $N8N_DIR
+docker compose pull
+docker compose up -d
+
+Kiểm tra phiên bản hiện tại:
+docker compose exec n8n n8n --version
+
+EOF
